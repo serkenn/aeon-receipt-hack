@@ -1,8 +1,9 @@
 # aeon
 
-iAEON アプリの認証・電子レシート取得を行う Python ツールキット。
+iAEON アプリの認証・電子レシート取得・食料在庫管理を行う Python ツールキット。
 
 `login.py` で iAEON にログインしてアクセストークンを取得し、電子レシート API を操作できる。
+`inventory.py` でレシートから購入食品を自動パースし、在庫DBに登録・管理できる。
 
 ## セットアップ
 
@@ -56,9 +57,13 @@ mitmproxy で `/api/aeonapp/1.0/receipt/members/auth` へのPOSTリクエスト�
 ACCESS_TOKEN="..."
 DEVICE_ID="bf533bf5-..."
 RECEIPT_ACCOUNT_ID="iighiqrqusuxrsyv"
+GOOGLE_API_KEY=""
+GOOGLE_SEARCH_ENGINE_ID=""
 ```
 
-## 使い方
+`GOOGLE_API_KEY` / `GOOGLE_SEARCH_ENGINE_ID` は食料在庫の商品情報検索用（任意）。未設定でもローカルキーワードマッチで動作する。
+
+## 電子レシート
 
 ### 基本的な流れ
 
@@ -140,6 +145,81 @@ img = IAEONReceiptClient.render_receipt_image(
 img.save("receipt.png")
 ```
 
+## 食料在庫管理
+
+レシートから購入した食品を自動パースし、SQLite DBに登録して在庫管理する。
+
+### CLI
+
+```bash
+# レシートから食料をインポート (デフォルト: 今月)
+python inventory.py import
+
+# 日付範囲を指定
+python inventory.py import --from-date 20260201 --to-date 20260213
+
+# 在庫一覧を表示
+python inventory.py stock
+
+# 期限切れ間近の在庫を表示 (デフォルト: 3日以内)
+python inventory.py expiring
+python inventory.py expiring --days 7
+```
+
+### パイプライン
+
+`inventory.py import` の処理フロー:
+
+1. iAEON認証 → レシート一覧取得
+2. 各レシートの詳細を取得
+3. 商品をパース（構造化データ優先 → テキスト行regexフォールバック）
+4. 商品情報を検索（ローカルキーワードマッチ → Google API フォールバック）
+5. SQLite DBに登録（重複インポート防止付き）
+6. サマリー表示
+
+### 商品分類
+
+2段階で商品を分類する:
+
+1. **ローカルキーワードマッチ**: 商品名のキーワードから即座に分類（API不要）
+   - `牛乳` → 飲料/牛乳・乳飲料 (冷蔵, 7日)
+   - `チョコ` → 菓子/チョコレート (常温, 180日)
+   - `鶏むね` → 肉類/鶏肉 (冷蔵, 3日)
+   - `ティッシュ` → 日用品 (非食品)
+2. **Google Custom Search API**: ローカルで判定できない場合にWeb検索（要API設定）
+
+### DB構成
+
+`food_inventory.db` (SQLite):
+
+| テーブル | 説明 |
+|---|---|
+| `products` | 商品マスタ（名前, カテゴリ, 内容量, 保存方法, 賞味期限日数） |
+| `purchases` | 購入履歴（商品, レシート, 店舗, 価格, 日時） |
+| `inventory` | 在庫状態（`in_stock` / `consumed` / `expired`） |
+| `search_cache` | Web検索結果キャッシュ |
+
+### Python API
+
+```python
+from food_inventory import FoodInventoryDB
+
+db = FoodInventoryDB()
+
+# 在庫一覧 (Cookpad/LLMエージェント用)
+items = db.get_in_stock_items()
+for item in items:
+    print(f"{item['name']} x{item['total_quantity']} [{item['category']}]")
+
+# 期限切れ間近 (LLMエージェント用)
+expiring = db.get_expiring_soon(days=3)
+
+# 消費済みにマーク
+db.mark_consumed("明治おいしい牛乳", count=1)
+
+db.close()
+```
+
 ## API リファレンス
 
 ### IAEONAuth
@@ -167,6 +247,19 @@ img.save("receipt.png")
 | `save_receipt_image(detail, output_dir, ...)` | レシート画像を PNG で保存。Path を返す |
 | `save_embedded_images(detail, output_dir)` | 埋め込みBMP画像を個別保存。Path リストを返す |
 
+### FoodInventoryDB
+
+| メソッド | 説明 |
+|---|---|
+| `import_receipt(receipt, product_infos?)` | レシート全体をDBにインポート。登録件数を返す |
+| `is_receipt_imported(receipt_id)` | 重複インポート防止チェック |
+| `upsert_product(name, info?)` | 商品マスタ登録/更新。product_id を返す |
+| `get_in_stock_items()` | 在庫一覧を返す（Cookpad/LLM用） |
+| `get_expiring_soon(days=3)` | 期限切れ間近の在庫を返す（LLM用） |
+| `mark_consumed(product_name, count=1)` | 在庫を消費済みにマーク |
+| `get_search_cache(product_name)` | 検索キャッシュ取得 |
+| `set_search_cache(product_name, result)` | 検索キャッシュ保存 |
+
 ### データクラス
 
 **ReceiptSummary**
@@ -188,6 +281,28 @@ img.save("receipt.png")
 | `lines` | list[str] | レシートテキスト行 |
 | `images` | dict[str, bytes] | 埋め込み画像 (名前 -> BMPバイナリ) |
 | `raw` | dict? | API レスポンス生データ |
+
+**ParsedProduct**
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `name` | str | 商品名 |
+| `price` | int | 価格 |
+| `quantity` | int | 数量 (デフォルト: 1) |
+| `discount` | int | 値引額 (デフォルト: 0) |
+| `barcode` | str? | バーコード |
+
+**ProductInfo**
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `category` | str | 大分類 (飲料, 菓子, 肉類 等) |
+| `subcategory` | str | 小分類 (チョコレート, 牛乳・乳飲料 等) |
+| `content_amount` | float? | 内容量 |
+| `content_unit` | str | 単位 (g, ml, 個 等) |
+| `manufacturer` | str | メーカー |
+| `storage_type` | str | 保存方法 (常温/冷蔵/冷凍) |
+| `is_food` | bool | 食品かどうか |
 
 ## API エンドポイント
 
@@ -240,11 +355,18 @@ img.save("receipt.png")
 ## ファイル構成
 
 ```
-iaeon_auth.py      # iAEON 認証モジュール (IAEONAuth)
-login.py           # ログインCLIスクリプト
-example.py         # レシート取得サンプルスクリプト
-requirements.txt   # 依存パッケージ
+iaeon_auth.py          # iAEON 認証モジュール (IAEONAuth)
+login.py               # ログインCLIスクリプト
+example.py             # レシート取得サンプルスクリプト
+inventory.py           # 食料在庫管理CLIスクリプト
+requirements.txt       # 依存パッケージ
 iaeon_receipt/
-├── __init__.py    # パッケージエクスポート
-└── client.py      # IAEONReceiptClient, ReceiptSummary, ReceiptDetail
+├── __init__.py        # パッケージエクスポート
+└── client.py          # IAEONReceiptClient, ReceiptSummary, ReceiptDetail
+food_inventory/
+├── __init__.py        # パッケージエクスポート
+├── models.py          # ParsedProduct, ProductInfo, ReceiptProducts
+├── db.py              # FoodInventoryDB (SQLite)
+├── parser.py          # レシート商品パーサー
+└── searcher.py        # 商品情報検索 (キーワードマッチ + Google API)
 ```
