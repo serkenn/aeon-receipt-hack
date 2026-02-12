@@ -13,7 +13,7 @@ iAEON アプリのログインフローを再現し、アクセストークン�
 
 import hashlib
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -253,7 +253,12 @@ class IAEONAuth:
         """現在のアクセストークン"""
         return self._access_token
 
-    def full_login(self, phone_number: str, password: str) -> str:
+    def full_login(
+        self,
+        phone_number: str,
+        password: str,
+        otp_provider: Optional[Callable[[], str]] = None,
+    ) -> str:
         """
         完全なログインフロー (対話式)
 
@@ -263,6 +268,7 @@ class IAEONAuth:
         Args:
             phone_number: 電話番号
             password: パスワード
+            otp_provider: OTP取得コールバック。指定時は input() の代わりに使用。
 
         Returns:
             アクセストークン
@@ -275,7 +281,10 @@ class IAEONAuth:
             self.request_sms()
             print("SMSを送信しました。")
 
-            auth_code = input("SMSで届いた6桁の認証コードを入力してください: ").strip()
+            if otp_provider is not None:
+                auth_code = otp_provider()
+            else:
+                auth_code = input("SMSで届いた6桁の認証コードを入力してください: ").strip()
             self.verify_sms_code(auth_code)
             print("SMS認証成功。")
 
