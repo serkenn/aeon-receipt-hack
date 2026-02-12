@@ -1,13 +1,13 @@
-# iaeon_receipt
+# aeon
 
-iAEON アプリの電子レシートを取得し、画像として保存する Python ライブラリ。
+iAEON アプリの認証・電子レシート取得を行う Python ツールキット。
 
-mitmproxy 等で取得した通信データから認証情報を抽出し、電子レシート API を操作する。
+`login.py` で iAEON にログインしてアクセストークンを取得し、電子レシート API を操作できる。
 
 ## セットアップ
 
 ```bash
-pip install requests Pillow
+pip install -r requirements.txt
 ```
 
 日本語フォント (NotoSansCJK) がシステムにインストールされていると、レシート画像が正しくレンダリングされる。
@@ -17,29 +17,45 @@ pip install requests Pillow
 sudo apt install fonts-noto-cjk
 ```
 
-## 必要な認証情報の取得
+## ログイン
 
-mitmproxy でiAEONアプリの HTTPS 通信をキャプチャし、以下の2つの値を取得する。
+`login.py` でiAEONアカウントにログインし、アクセストークンを `.env` に保存する。
 
-### 1. access_token
+```bash
+# 対話式 (電話番号・パスワードを入力)
+python login.py
 
-任意の `aeonapp.aeon.com` 宛リクエストの `Authorization` ヘッダーから取得。
+# 引数で指定
+python login.py --phone 09012345678 --password yourpassword
 
+# デバイスIDを指定 (同じIDを使い続けるとSMS認証をスキップできる場合がある)
+python login.py --phone 09012345678 --password yourpassword --device-id <UUID>
 ```
-Authorization: Bearer EMLBl6dengx27u7f6AxFQ0hNdA0MZwmn_00000000000000000000000000000000_4300077585681162
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                      この部分が access_token
-```
 
-### 2. receipt_account_id
+認証フロー:
+1. 電話番号 + パスワードでログイン
+2. SMS認証コードの送信・検証 (新デバイス時)
+3. Bearerトークン取得
+4. アクセストークン取得 → `.env` に `ACCESS_TOKEN` と `DEVICE_ID` を保存
 
-電子レシート画面を開いた際に発生する `/api/aeonapp/1.0/receipt/members/auth` へのPOSTリクエストボディから取得。
+### receipt_account_id の取得
+
+電子レシート機能を使うには `RECEIPT_ACCOUNT_ID` も必要。
+mitmproxy で `/api/aeonapp/1.0/receipt/members/auth` へのPOSTリクエストボディから取得する。
 
 ```json
 {
   "accountId": "iighiqrqusuxrsyv",  // <-- この値
   "accessToken": "..."
 }
+```
+
+### .env ファイル
+
+```
+ACCESS_TOKEN="..."
+DEVICE_ID="bf533bf5-..."
+RECEIPT_ACCOUNT_ID="iighiqrqusuxrsyv"
 ```
 
 ## 使い方
@@ -126,6 +142,18 @@ img.save("receipt.png")
 
 ## API リファレンス
 
+### IAEONAuth
+
+| メソッド | 説明 |
+|---|---|
+| `login(phone, password)` | ログイン。SMS認証が必要な場合 code `10021`/`10008` を返す |
+| `request_sms()` | SMS認証コード送信リクエスト |
+| `verify_sms_code(auth_code)` | SMS認証コード検証 |
+| `login_token()` | Bearerトークン取得。`_access_token` に保存される |
+| `get_access_token(client_id?)` | サービス用アクセストークン取得 |
+| `full_login(phone, password)` | 完全なログインフロー (対話式、SMS入力あり) |
+| `get_service_token()` | サービス用 (client_id=...0003) アクセストークン取得 |
+
 ### IAEONReceiptClient
 
 | メソッド | 説明 |
@@ -161,12 +189,22 @@ img.save("receipt.png")
 | `images` | dict[str, bytes] | 埋め込み画像 (名前 -> BMPバイナリ) |
 | `raw` | dict? | API レスポンス生データ |
 
-## iAEON 電子レシート API エンドポイント
+## API エンドポイント
+
+### 認証
 
 | メソッド | エンドポイント | 説明 |
 |---|---|---|
-| GET | `/api/iaeon/auth/1.0/account/token` | 認証トークン取得 |
-| POST | `/api/iaeon/auth/1.0/account/access_token` | アクセストークン取得 |
+| POST | `/api/iaeon/auth/1.0/login` | ログイン (電話番号 + パスワードハッシュ) |
+| PUT | `/api/iaeon/auth/1.0/sms` | SMS認証コード送信 |
+| POST | `/api/iaeon/auth/1.0/auth_code` | SMS認証コード検証 |
+| POST | `/api/iaeon/auth/1.0/login/token` | Bearerトークン取得 |
+| POST | `/api/iaeon/auth/1.0/account/access_token` | サービス用アクセストークン取得 |
+
+### 電子レシート
+
+| メソッド | エンドポイント | 説明 |
+|---|---|---|
 | GET | `/api/iaeon/user/1.0/account/information` | ユーザー情報取得 |
 | POST | `/api/aeonapp/1.0/receipt/members/auth` | レシートサービス認証 |
 | POST | `/api/aeonapp/1.0/receipt/receipts` | レシート一覧 |
@@ -202,8 +240,11 @@ img.save("receipt.png")
 ## ファイル構成
 
 ```
+iaeon_auth.py      # iAEON 認証モジュール (IAEONAuth)
+login.py           # ログインCLIスクリプト
+example.py         # レシート取得サンプルスクリプト
+requirements.txt   # 依存パッケージ
 iaeon_receipt/
 ├── __init__.py    # パッケージエクスポート
 └── client.py      # IAEONReceiptClient, ReceiptSummary, ReceiptDetail
-example.py         # 使い方サンプルスクリプト
 ```
