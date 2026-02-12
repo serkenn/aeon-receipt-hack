@@ -1,2 +1,4 @@
 example.py
 .env
+/receipts
+/__pycache__
